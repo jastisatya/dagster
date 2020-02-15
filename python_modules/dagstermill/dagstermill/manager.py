@@ -19,7 +19,7 @@ from dagster.cli import load_handle
 from dagster.core.definitions.dependency import SolidHandle
 from dagster.core.execution.api import create_execution_plan, scoped_pipeline_context
 from dagster.core.execution.context_creation_pipeline import (
-    ResourcesStack,
+    ResourceInitializationEventGenerator,
     get_required_resource_keys_to_init,
 )
 from dagster.core.instance import DagsterInstance
@@ -41,23 +41,16 @@ class Manager(object):
         self.in_pipeline = False
         self.marshal_dir = None
         self.context = None
-        self.resources_stack = None
+        self.resources_generator = None
 
     @contextmanager
     def _setup_resources(
         self, pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init
     ):
-        '''This context manager is a drop-in replacement for
-        dagster.core.execution.context_creation_pipeline.create_resources. It uses the Manager's
-        instance of ResourceStack to create resources, but does not tear them down when the
-        context manager returns -- teardown must be managed manually using Manager.teardown().
-        '''
-
-        # pylint: disable=protected-access
-        self.resources_stack = ResourcesStack(
+        self.resources_generator = ResourceInitializationEventGenerator(
             pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init
         )
-        yield self.resources_stack.create()
+        yield self.resources_generator
 
     def reconstitute_pipeline_context(
         self,
@@ -282,8 +275,8 @@ class Manager(object):
         scrapbook.glue(event_id, out_file_path)
 
     def teardown_resources(self):
-        if self.resources_stack is not None:
-            self.resources_stack.teardown()
+        if self.resources_generator is not None:
+            self.resources_generator.teardown()
 
     def load_parameter(self, input_name, input_value):
         input_def = self.solid_def.input_def_named(input_name)
