@@ -26,6 +26,19 @@ data:
         instance_config_map: "{{ template "dagster.fullname" .}}-instance"
         image_pull_policy: "{{ .Values.imagePullPolicy }}"
         job_namespace: "{{ .Release.Namespace }}"
+        {{- if .Values.job_runner.env_from_config_maps }}
+        env_from_config_maps:
+          {{- range $name := .Values.job_runner.env_from_config_maps }}
+            - {{ $name | quote }}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.job_runner.env_from_secrets }}
+        env_from_secrets:
+          {{- range $name := .Values.job_runner.env_from_secrets }}
+            - {{ $name | quote }}
+          {{- end }}
+        {{- end }}
+
 
     run_storage:
       module: dagster_postgres.run_storage

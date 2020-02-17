@@ -1,3 +1,5 @@
+import os
+
 from dagster_graphql.client.util import execution_params_from_pipeline_run
 from kubernetes import client, config
 
@@ -68,10 +70,12 @@ class K8sRunLauncher(RunLauncher, ConfigurableClass):
         job_namespace (Optional[str]): The namespace into which to launch new jobs. Note that any
             other Kubernetes resources the Job requires (such as the service account) must be
             present in this namespace. Default: ``"default"``
-        env_froms (Optional[List[str]]): A list of custom ConfigMapEnvSource names from which to
+        env_from_config_maps (Optional[List[str]]): A list of custom ConfigMapEnvSource names from which to
             draw environment variables (using ``envFrom``) for the Job. Default: ``[]``. See:
-            https://kubernetes.io/docs/tasks/inject-data-application/define-environment-variable-container/#define-an-environment-variable-for-a-container
-
+        https://kubernetes.io/docs/tasks/inject-data-application/define-environment-variable-container/#define-an-environment-variable-for-a-container
+        env_from_secrets (Optional[List[str]]): A list of custom Secret names from which to
+            draw environment variables (using ``envFrom``) for the Job. Default: ``[]``. See:
+        https://kubernetes.io/docs/tasks/inject-data-application/distribute-credentials-secure/#configure-all-key-value-pairs-in-a-secret-as-container-environment-variables
     '''
 
     def __init__(
@@ -85,7 +89,8 @@ class K8sRunLauncher(RunLauncher, ConfigurableClass):
         kubeconfig_file=None,
         inst_data=None,
         job_namespace="default",
-        env_froms=None,
+        env_from_config_maps=None,
+        env_from_secrets=None,
     ):
         self._inst_data = check.opt_inst_param(inst_data, 'inst_data', ConfigurableClassData)
         self.job_image = check.str_param(job_image, 'job_image')
@@ -94,7 +99,12 @@ class K8sRunLauncher(RunLauncher, ConfigurableClass):
         self.image_pull_policy = check.str_param(image_pull_policy, 'image_pull_policy')
         self.service_account_name = check.str_param(service_account_name, 'service_account_name')
         self.job_namespace = check.str_param(job_namespace, 'job_namespace')
-        self._env_froms = check.opt_list_param(env_froms, 'env_froms', of_type=str)
+        self._env_from_config_maps = check.opt_list_param(
+            env_from_config_maps, 'env_from_config_maps', of_type=str
+        )
+        self._env_from_secrets = check.opt_list_param(
+            env_from_secrets, 'env_from_secrets', of_type=str
+        )
         check.bool_param(load_kubeconfig, 'load_kubeconfig')
         if load_kubeconfig:
             check.str_param(kubeconfig_file, 'kubeconfig_file')
@@ -119,6 +129,8 @@ class K8sRunLauncher(RunLauncher, ConfigurableClass):
             'image_pull_secrets': Field(list, is_required=False),
             'image_pull_policy': Field(str, is_required=False, default_value='Always'),
             'job_namespace': str,
+            'env_from_config_maps': Field(list, is_required=False),
+            'env_from_secrets': Field(list, is_required=False),
         }
 
     @classmethod
@@ -131,10 +143,25 @@ class K8sRunLauncher(RunLauncher, ConfigurableClass):
 
     @property
     def env_froms(self):
-        return [
+        '''This constructs a list of env_from sources. Along with a default base environment
+        config map which we always load, the config maps and secrets specified via
+        config_map_env_froms and secret_env_froms will be pulled into the job construction here.
+        '''
+        base_env_from = client.V1EnvFromSource(
+            config_map_ref=client.V1ConfigMapEnvSource(name='dagster-job-runner-env')
+        )
+
+        config_maps = [
             client.V1EnvFromSource(config_map_ref=client.V1ConfigMapEnvSource(name=env_from))
-            for env_from in self._env_froms
+            for env_from in self._env_from_config_maps
         ]
+
+        secrets = [
+            client.V1EnvFromSource(secret_ref=client.V1SecretEnvSource(name=env_from))
+            for env_from in self._env_from_secrets
+        ]
+
+        return [base_env_from] + config_maps + secrets
 
     def construct_job(self, run):
         check.inst_param(run, 'run', PipelineRun)
@@ -159,7 +186,6 @@ class K8sRunLauncher(RunLauncher, ConfigurableClass):
             ],
             image_pull_policy=self.image_pull_policy,
             env=[
-                client.V1EnvVar(name='DAGSTER_HOME', value='/opt/dagster/dagster_home'),
                 client.V1EnvVar(
                     name='DAGSTER_PG_PASSWORD',
                     value_from=client.V1EnvVarSource(
@@ -173,7 +199,9 @@ class K8sRunLauncher(RunLauncher, ConfigurableClass):
             volume_mounts=[
                 client.V1VolumeMount(
                     name='dagster-instance',
-                    mount_path='/opt/dagster/dagster_home/dagster.yaml',
+                    mount_path='{dagster_home}/dagster.yaml'.format(
+                        dagster_home=os.environ['DAGSTER_HOME']
+                    ),
                     sub_path='dagster.yaml',
                 )
             ],
