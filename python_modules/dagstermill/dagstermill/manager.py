@@ -1,7 +1,6 @@
 import os
 import pickle
 import uuid
-from contextlib import contextmanager
 
 import six
 
@@ -17,10 +16,12 @@ from dagster import (
 )
 from dagster.cli import load_handle
 from dagster.core.definitions.dependency import SolidHandle
+from dagster.core.definitions.resource import ScopedResourcesBuilder
 from dagster.core.execution.api import create_execution_plan, scoped_pipeline_context
 from dagster.core.execution.context_creation_pipeline import (
-    ResourceInitializationEventGenerator,
+    EventGenerationManager,
     get_required_resource_keys_to_init,
+    resource_initialization_event_generator,
 )
 from dagster.core.instance import DagsterInstance
 from dagster.core.serdes import unpack_value
@@ -33,6 +34,15 @@ from .errors import DagstermillError
 from .serialize import PICKLE_PROTOCOL, read_value, write_value
 
 
+class DagstermillResourceEventGenerationManager(EventGenerationManager):
+    def generate_teardown_events(self):
+        return iter(())
+
+    def teardown(self):
+        for _ in super(DagstermillResourceEventGenerationManager, self).generate_teardown_events():
+            pass
+
+
 class Manager(object):
     def __init__(self):
         self.handle = None
@@ -41,16 +51,18 @@ class Manager(object):
         self.in_pipeline = False
         self.marshal_dir = None
         self.context = None
-        self.resources_generator = None
+        self.resource_manager = None
 
-    @contextmanager
     def _setup_resources(
         self, pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init
     ):
-        self.resources_generator = ResourceInitializationEventGenerator(
+        generator = resource_initialization_event_generator(
             pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init
         )
-        yield self.resources_generator
+        self.resource_manager = DagstermillResourceEventGenerationManager(
+            generator, ScopedResourcesBuilder
+        )
+        return self.resource_manager
 
     def reconstitute_pipeline_context(
         self,
@@ -275,8 +287,8 @@ class Manager(object):
         scrapbook.glue(event_id, out_file_path)
 
     def teardown_resources(self):
-        if self.resources_generator is not None:
-            self.resources_generator.teardown()
+        if self.resource_manager is not None:
+            self.resource_manager.teardown()
 
     def load_parameter(self, input_name, input_value):
         input_def = self.solid_def.input_def_named(input_name)

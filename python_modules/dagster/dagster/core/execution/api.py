@@ -99,17 +99,17 @@ def execute_run_iterator(pipeline, pipeline_run, instance):
         pipeline, environment_dict=pipeline_run.environment_dict, run_config=pipeline_run
     )
 
-    with pipeline_initialization_manager(
+    initialization_manager = pipeline_initialization_manager(
         pipeline, pipeline_run.environment_dict, pipeline_run, instance, execution_plan
-    ) as initialization_manager:
-        for event in initialization_manager.generate_events():
+    )
+    for event in initialization_manager.generate_setup_events():
+        yield event
+    pipeline_context = initialization_manager.get_object()
+    if pipeline_context:
+        for event in _pipeline_execution_iterator(pipeline_context, execution_plan, pipeline_run):
             yield event
-        pipeline_context = initialization_manager.get_pipeline_context()
-        if pipeline_context:
-            for event in _pipeline_execution_iterator(
-                pipeline_context, execution_plan, pipeline_run
-            ):
-                yield event
+    for event in initialization_manager.generate_teardown_events():
+        yield event
 
 
 def execute_pipeline_iterator(pipeline, environment_dict=None, run_config=None, instance=None):
@@ -185,37 +185,37 @@ def execute_pipeline(
 
     pipeline_run = _create_run(instance, pipeline, run_config, environment_dict)
 
-    with pipeline_initialization_manager(
+    initialization_manager = pipeline_initialization_manager(
         pipeline,
         environment_dict,
         pipeline_run,
         instance,
         execution_plan,
         raise_on_error=raise_on_error,
-    ) as initialization_manager:
-        event_list = [event for event in initialization_manager.generate_events()]
-        pipeline_context = initialization_manager.get_pipeline_context()
-        if pipeline_context:
-            event_list.extend(
-                _pipeline_execution_iterator(pipeline_context, execution_plan, pipeline_run)
-            )
-
-        return PipelineExecutionResult(
-            pipeline,
-            run_config.run_id,
-            event_list,
-            lambda: scoped_pipeline_context(
-                pipeline,
-                environment_dict,
-                pipeline_run,
-                instance,
-                execution_plan,
-                system_storage_data=SystemStorageData(
-                    intermediates_manager=pipeline_context.intermediates_manager,
-                    file_manager=pipeline_context.file_manager,
-                ),
-            ),
+    )
+    event_list = [event for event in initialization_manager.generate_setup_events()]
+    pipeline_context = initialization_manager.get_object()
+    if pipeline_context:
+        event_list.extend(
+            _pipeline_execution_iterator(pipeline_context, execution_plan, pipeline_run)
         )
+    event_list.extend(initialization_manager.generate_teardown_events())
+    return PipelineExecutionResult(
+        pipeline,
+        run_config.run_id,
+        event_list,
+        lambda: scoped_pipeline_context(
+            pipeline,
+            environment_dict,
+            pipeline_run,
+            instance,
+            execution_plan,
+            system_storage_data=SystemStorageData(
+                intermediates_manager=pipeline_context.intermediates_manager,
+                file_manager=pipeline_context.file_manager,
+            ),
+        ),
+    )
 
 
 def execute_pipeline_with_preset(
@@ -278,18 +278,20 @@ def execute_plan_iterator(execution_plan, pipeline_run, environment_dict=None, i
     environment_dict = check.opt_dict_param(environment_dict, 'environment_dict')
     instance = check.inst_param(instance, 'instance', DagsterInstance)
 
-    with pipeline_initialization_manager(
+    initialization_manager = pipeline_initialization_manager(
         execution_plan.pipeline_def, environment_dict, pipeline_run, instance, execution_plan
-    ) as initialization_manager:
-        for event in initialization_manager.generate_events():
-            yield event
+    )
+    for event in initialization_manager.generate_setup_events():
+        yield event
 
-        pipeline_context = initialization_manager.get_pipeline_context()
-        if pipeline_context:
-            for event in _steps_execution_iterator(
-                pipeline_context, execution_plan=execution_plan, pipeline_run=pipeline_run
-            ):
-                yield event
+    pipeline_context = initialization_manager.get_object()
+    if pipeline_context:
+        for event in _steps_execution_iterator(
+            pipeline_context, execution_plan=execution_plan, pipeline_run=pipeline_run
+        ):
+            yield event
+    for event in initialization_manager.generate_teardown_events():
+        yield event
 
 
 def execute_plan(execution_plan, instance, pipeline_run, environment_dict=None):

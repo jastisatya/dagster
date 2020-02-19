@@ -1,8 +1,6 @@
 import sys
-from collections import namedtuple
+from collections import deque, namedtuple
 from contextlib import contextmanager
-
-from contextlib2 import ExitStack
 
 from dagster import check
 from dagster.core.definitions.handle import ExecutionTargetHandle
@@ -12,7 +10,6 @@ from dagster.core.definitions.system_storage import SystemStorageData
 from dagster.core.engine.init import InitExecutorContext
 from dagster.core.errors import (
     DagsterError,
-    DagsterInvariantViolationError,
     DagsterResourceFunctionError,
     DagsterUserCodeExecutionError,
     user_code_error_boundary,
@@ -165,7 +162,36 @@ def create_context_creation_data(
     )
 
 
-@contextmanager
+class EventGenerationManager(object):
+    def __init__(self, generator, object_cls):
+        self.generator = generator
+        self.object_cls = object_cls
+        self.object = None
+        self.has_generated = False
+
+    def generate_setup_events(self):
+        self.has_generated = True
+        try:
+            while self.object is None:
+                obj = next(self.generator)
+                if isinstance(obj, self.object_cls):
+                    self.object = obj
+                else:
+                    yield obj
+        except StopIteration:
+            pass
+
+    def get_object(self):
+        if not self.has_generated:
+            check.failed('Called `get_object` before `generate_setup_events`')
+        return self.object
+
+    def generate_teardown_events(self):
+        if self.object:
+            for event in self.generator:
+                yield event
+
+
 def pipeline_initialization_manager(
     pipeline_def,
     environment_dict,
@@ -179,9 +205,9 @@ def pipeline_initialization_manager(
     scoped_resources_builder_cm = check.opt_callable_param(
         scoped_resources_builder_cm,
         'scoped_resources_builder_cm',
-        default=resource_initialization_context_manager,
+        default=resource_initialization_manager,
     )
-    manager = PipelineInitializationEventGenerator(
+    generator = pipeline_initialization_event_generator(
         pipeline_def,
         environment_dict,
         pipeline_run,
@@ -191,112 +217,93 @@ def pipeline_initialization_manager(
         system_storage_data,
         raise_on_error,
     )
+    return EventGenerationManager(generator, SystemPipelineExecutionContext)
+
+
+def pipeline_initialization_event_generator(
+    pipeline_def,
+    environment_dict,
+    pipeline_run,
+    instance,
+    execution_plan,
+    scoped_resources_builder_cm,
+    system_storage_data=None,
+    raise_on_error=False,
+):
+    pipeline_def = check.inst_param(pipeline_def, 'pipeline_def', PipelineDefinition)
+    environment_dict = check.dict_param(environment_dict, 'environment_dict', key_type=str)
+    pipeline_run = check.inst_param(pipeline_run, 'pipeline_run', PipelineRun)
+    instance = check.inst_param(instance, 'instance', DagsterInstance)
+    execution_plan = check.inst_param(execution_plan, 'execution_plan', ExecutionPlan)
+    scoped_resources_builder_cm = check.callable_param(
+        scoped_resources_builder_cm, 'scoped_resources_builder_cm'
+    )
+    system_storage_data = check.opt_inst_param(
+        system_storage_data, 'system_storage_data', SystemStorageData
+    )
+    raise_on_error = check.bool_param(raise_on_error, 'raise_on_error')
+
+    pipeline_context = None
+    resources_manager = None
+
     try:
-        yield manager
-    finally:
-        manager.teardown()
-
-
-class PipelineInitializationEventGenerator(object):
-    def __init__(
-        self,
-        pipeline_def,
-        environment_dict,
-        pipeline_run,
-        instance,
-        execution_plan,
-        scoped_resources_builder_cm,
-        system_storage_data=None,
-        raise_on_error=False,
-    ):
-        self.pipeline_def = check.inst_param(pipeline_def, 'pipeline_def', PipelineDefinition)
-        self.environment_dict = check.dict_param(environment_dict, 'environment_dict', key_type=str)
-        self.pipeline_run = check.inst_param(pipeline_run, 'pipeline_run', PipelineRun)
-        self.instance = check.inst_param(instance, 'instance', DagsterInstance)
-        self.execution_plan = check.inst_param(execution_plan, 'execution_plan', ExecutionPlan)
-        self.scoped_resources_builder_cm = check.callable_param(
-            scoped_resources_builder_cm, 'scoped_resources_builder_cm'
+        context_creation_data = create_context_creation_data(
+            pipeline_def, environment_dict, pipeline_run, instance, execution_plan,
         )
-        self.system_storage_data = check.opt_inst_param(
-            system_storage_data, 'system_storage_data', SystemStorageData
+        executor_config = create_executor_config(context_creation_data)
+        log_manager = create_log_manager(context_creation_data)
+        resources_manager = scoped_resources_builder_cm(
+            context_creation_data.pipeline_def,
+            context_creation_data.environment_config,
+            context_creation_data.pipeline_run,
+            log_manager,
+            context_creation_data.resource_keys_to_init,
         )
-        self.raise_on_error = check.bool_param(raise_on_error, 'raise_on_error')
-        self.stack = ExitStack()
-        self._has_generated = False
-        self._pipeline_context = None
-
-    def teardown(self):
-        self.stack.close()
-
-    def get_pipeline_context(self):
-        if not self._has_generated:
-            raise DagsterInvariantViolationError(
-                'Accessed `get_pipeline_context` before `generate_events`'
-            )
-        return self._pipeline_context
-
-    def generate_events(self):
-        self._has_generated = True
-        try:
-            context_creation_data = create_context_creation_data(
-                self.pipeline_def,
-                self.environment_dict,
-                self.pipeline_run,
-                self.instance,
-                self.execution_plan,
-            )
-            executor_config = create_executor_config(context_creation_data)
-            log_manager = create_log_manager(context_creation_data)
-            resources_manager = self.stack.enter_context(
-                self.scoped_resources_builder_cm(
-                    context_creation_data.pipeline_def,
-                    context_creation_data.environment_config,
-                    context_creation_data.pipeline_run,
-                    log_manager,
-                    context_creation_data.resource_keys_to_init,
-                )
-            )
-            for event in resources_manager.generate_events():
-                yield event
-            scoped_resources_builder = resources_manager.get_resources_builder()
-            system_storage_data = create_system_storage_data(
-                context_creation_data, self.system_storage_data, scoped_resources_builder
-            )
-            self._pipeline_context = construct_pipeline_execution_context(
-                context_creation_data=context_creation_data,
-                scoped_resources_builder=scoped_resources_builder,
-                system_storage_data=system_storage_data,
-                log_manager=log_manager,
-                executor_config=executor_config,
-                raise_on_error=self.raise_on_error,
+        for event in resources_manager.generate_setup_events():
+            yield event
+        scoped_resources_builder = resources_manager.get_object()
+        system_storage_data = create_system_storage_data(
+            context_creation_data, system_storage_data, scoped_resources_builder
+        )
+        pipeline_context = construct_pipeline_execution_context(
+            context_creation_data=context_creation_data,
+            scoped_resources_builder=scoped_resources_builder,
+            system_storage_data=system_storage_data,
+            log_manager=log_manager,
+            executor_config=executor_config,
+            raise_on_error=raise_on_error,
+        )
+        yield pipeline_context
+        for event in resources_manager.generate_teardown_events():
+            yield event
+    except DagsterError as dagster_error:
+        if pipeline_context is None:
+            user_facing_exc_info = (
+                # pylint does not know original_exc_info exists is is_user_code_error is true
+                # pylint: disable=no-member
+                dagster_error.original_exc_info
+                if dagster_error.is_user_code_error
+                else sys.exc_info()
             )
 
-        except DagsterError as dagster_error:
-            if self._pipeline_context is None:
-                user_facing_exc_info = (
-                    # pylint does not know original_exc_info exists is is_user_code_error is true
-                    # pylint: disable=no-member
-                    dagster_error.original_exc_info
-                    if dagster_error.is_user_code_error
-                    else sys.exc_info()
-                )
+            error_info = serializable_error_info_from_exc_info(user_facing_exc_info)
+            yield DagsterEvent.pipeline_init_failure(
+                pipeline_name=pipeline_def.name,
+                failure_data=PipelineInitFailureData(error=error_info),
+                log_manager=_create_context_free_log_manager(instance, pipeline_run, pipeline_def),
+            )
 
-                error_info = serializable_error_info_from_exc_info(user_facing_exc_info)
-                yield DagsterEvent.pipeline_init_failure(
-                    pipeline_name=self.pipeline_def.name,
-                    failure_data=PipelineInitFailureData(error=error_info),
-                    log_manager=_create_context_free_log_manager(
-                        self.instance, self.pipeline_run, self.pipeline_def
-                    ),
-                )
+            if resources_manager:
+                for event in resources_manager.generate_teardown_events():
+                    yield event
 
-                if self.raise_on_error:
-                    raise dagster_error
-
-            # if we've caught an error after context init we're in a problematic state and
-            # should just raise
-            else:
+            if raise_on_error:
                 raise dagster_error
+
+        # if we've caught an error after context init we're in a problematic state and
+        # should just raise
+        else:
+            raise dagster_error
 
 
 def create_system_storage_data(
@@ -390,138 +397,89 @@ def construct_pipeline_execution_context(
     )
 
 
-@contextmanager
-def resource_initialization_context_manager(
+def resource_initialization_manager(
     pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init,
 ):
-    generator = ResourceInitializationEventGenerator(
+    generator = resource_initialization_event_generator(
         pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init,
     )
+    return EventGenerationManager(generator, ScopedResourcesBuilder)
+
+
+def resource_initialization_event_generator(
+    pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init
+):
+    check.inst_param(pipeline_def, 'pipeline_def', PipelineDefinition)
+    check.inst_param(environment_config, 'environment_config', EnvironmentConfig)
+    check.inst_param(pipeline_run, 'pipeline_run', PipelineRun)
+    check.inst_param(log_manager, 'log_manager', DagsterLogManager)
+    check.set_param(resource_keys_to_init, 'resource_keys_to_init', of_type=str)
+
+    resource_instances = {}
+    mode_definition = pipeline_def.get_mode_definition(pipeline_run.mode)
+    resource_managers = deque()
+
+    for resource_name, resource_def in sorted(mode_definition.resource_defs.items()):
+        if not resource_name in resource_keys_to_init:
+            continue
+        resource_context = InitResourceContext(
+            pipeline_def=pipeline_def,
+            resource_def=resource_def,
+            resource_config=environment_config.resources.get(resource_name, {}).get('config'),
+            run_id=pipeline_run.run_id,
+            log_manager=log_manager,
+        )
+        manager = single_resource_generation_manager(resource_context, resource_name, resource_def)
+        for event in manager.generate_setup_events():
+            if event:
+                yield event
+        resource_instances[resource_name] = manager.get_object().resource
+        resource_managers.append(manager)
+
+    yield ScopedResourcesBuilder(resource_instances)
+    while len(resource_managers) > 0:
+        manager = resource_managers.pop()
+        for event in manager.generate_teardown_events():
+            yield event
+
+
+class WrappedResource(object):
+    def __init__(self, obj):
+        self.resource = obj
+
+
+def single_resource_generation_manager(context, resource_name, resource_def):
+    generator = single_resource_event_generator(context, resource_name, resource_def)
+    return EventGenerationManager(generator, WrappedResource)
+
+
+def single_resource_event_generator(context, resource_name, resource_def):
     try:
-        yield generator
-    finally:
-        generator.teardown()
-
-
-class ResourceInitializationEventGenerator(object):
-    def __init__(
-        self, pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init,
-    ):
-        check.inst_param(pipeline_def, 'pipeline_def', PipelineDefinition)
-        check.inst_param(environment_config, 'environment_config', EnvironmentConfig)
-        check.inst_param(pipeline_run, 'pipeline_run', PipelineRun)
-        check.inst_param(log_manager, 'log_manager', DagsterLogManager)
-        check.set_param(resource_keys_to_init, 'resource_keys_to_init', of_type=str)
-
-        self.resource_instances = {}
-        self.mode_definition = pipeline_def.get_mode_definition(pipeline_run.mode)
-        self.pipeline_def = pipeline_def
-        self.environment_config = environment_config
-        self.pipeline_run = pipeline_run
-        self.log_manager = log_manager
-        self.stack = ExitStack()
-        self.resource_keys_to_init = resource_keys_to_init
-        self.resource_managers = []
-        self._has_generated = False
-
-    def teardown(self):
-        self.stack.close()
-
-    def get_resources_builder(self):
-        if not self._has_generated:
-            raise DagsterInvariantViolationError(
-                'Accessed `get_resources_builder` before `generate_events`'
-            )
-        return ScopedResourcesBuilder(self.resource_instances)
-
-    def generate_events(self):
-        self._has_generated = True
-        for resource_name, resource_def in sorted(self.mode_definition.resource_defs.items()):
-            if not resource_name in self.resource_keys_to_init:
-                continue
-            resource_context = InitResourceContext(
-                pipeline_def=self.pipeline_def,
-                resource_def=resource_def,
-                resource_config=self.environment_config.resources.get(resource_name, {}).get(
-                    'config'
-                ),
-                run_id=self.pipeline_run.run_id,
-                log_manager=self.log_manager,
-            )
-            manager = self.stack.enter_context(
-                single_resource_context_manager(resource_context, resource_name, resource_def)
-            )
-            for event in manager.generate_events():
-                if event:
-                    yield event
-            self.resource_instances[resource_name] = manager.get_resource()
-
-
-@contextmanager
-def single_resource_context_manager(context, resource_name, resource_def):
-    generator = SingleResourceEventGenerator(context, resource_name, resource_def)
-    try:
-        yield generator
-    finally:
-        generator.teardown()
-
-
-class SingleResourceEventGenerator(object):
-    def __init__(self, context, resource_name, resource_def):
-        super(SingleResourceEventGenerator, self).__init__()
-        self.context = context
-        self.resource_name = resource_name
-        self.resource_def = resource_def
-        self.gen = None
-        self.resource = None
-        self._has_generated = False
-
-    def teardown(self):
-        if not self.gen:
-            return
-        try:
-            msg_fn = lambda: 'Error executing resource_fn on ResourceDefinition {name}'.format(
-                name=self.resource_name
-            )
-            with user_code_error_boundary(DagsterResourceFunctionError, msg_fn):
-                try:
-                    next(self.gen)
-                except StopIteration:
-                    pass
-                else:
-                    check.failed(
-                        'Resource generator {name} yielded more than one item.'.format(
-                            name=self.resource_name
-                        )
+        msg_fn = lambda: 'Error executing resource_fn on ResourceDefinition {name}'.format(
+            name=resource_name
+        )
+        with user_code_error_boundary(DagsterResourceFunctionError, msg_fn):
+            try:
+                resource_or_gen = resource_def.resource_fn(context)
+                gen = ensure_gen(resource_or_gen)
+                resource = next(gen)
+                yield WrappedResource(resource)
+            except StopIteration:
+                check.failed(
+                    'Resource generator {name} must yield one item.'.format(name=resource_name)
+                )
+            try:
+                next(gen)
+            except StopIteration:
+                pass
+            else:
+                check.failed(
+                    'Resource generator {name} yielded more than one item.'.format(
+                        name=resource_name
                     )
-        except DagsterUserCodeExecutionError as dagster_user_error:
-            raise dagster_user_error
-
-    def get_resource(self):
-        if not self._has_generated:
-            raise DagsterInvariantViolationError('Accessed `get_resource` before `generate_events`')
-        return self.resource
-
-    def generate_events(self):
-        self._has_generated = True
-        try:
-            msg_fn = lambda: 'Error executing resource_fn on ResourceDefinition {name}'.format(
-                name=self.resource_name
-            )
-            with user_code_error_boundary(DagsterResourceFunctionError, msg_fn):
-                try:
-                    resource_or_gen = self.resource_def.resource_fn(self.context)
-                    self.gen = ensure_gen(resource_or_gen)
-                    self.resource = next(self.gen)
-                    yield
-                except StopIteration:
-                    check.failed(
-                        'Resource generator {name} must yield one item.'.format(
-                            name=self.resource_name
-                        )
-                    )
-        except DagsterUserCodeExecutionError as dagster_user_error:
-            raise dagster_user_error
+                )
+    except DagsterUserCodeExecutionError as dagster_user_error:
+        raise dagster_user_error
 
 
 @contextmanager
@@ -531,7 +489,7 @@ def scoped_pipeline_context(
     pipeline_run,
     instance,
     execution_plan,
-    scoped_resources_builder_cm=resource_initialization_context_manager,
+    scoped_resources_builder_cm=resource_initialization_manager,
     system_storage_data=None,
     raise_on_error=False,
 ):
@@ -543,7 +501,7 @@ def scoped_pipeline_context(
     check.callable_param(scoped_resources_builder_cm, 'scoped_resources_builder_cm')
     check.opt_inst_param(system_storage_data, 'system_storage_data', SystemStorageData)
 
-    with pipeline_initialization_manager(
+    initialization_manager = pipeline_initialization_manager(
         pipeline_def,
         environment_dict,
         pipeline_run,
@@ -552,11 +510,13 @@ def scoped_pipeline_context(
         scoped_resources_builder_cm=scoped_resources_builder_cm,
         system_storage_data=system_storage_data,
         raise_on_error=raise_on_error,
-    ) as initialization_manager:
-        for _ in initialization_manager.generate_events():
-            pass
+    )
+    for _ in initialization_manager.generate_setup_events():
+        pass
 
-        yield initialization_manager.get_pipeline_context()
+    yield initialization_manager.get_object()
+    for _ in initialization_manager.generate_teardown_events():
+        pass
 
 
 def create_log_manager(context_creation_data):
