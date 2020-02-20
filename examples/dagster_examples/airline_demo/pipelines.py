@@ -1,7 +1,7 @@
 """Pipeline definitions for the airline_demo."""
 from dagster_aws.s3.file_cache import s3_file_cache
 from dagster_aws.s3.file_manager import S3FileHandle
-from dagster_aws.s3.resources import s3_resource
+from dagster_aws.s3.resources import boto_s3_client
 from dagster_aws.s3.solids import file_handle_to_s3
 from dagster_aws.s3.system_storage import s3_plus_default_storage_defs
 from dagster_pyspark import pyspark_resource
@@ -36,7 +36,7 @@ test_mode = ModeDefinition(
         'spark': pyspark_resource,
         'db_info': redshift_db_info_resource,
         'tempfile': tempfile_resource,
-        's3': s3_resource,
+        's3': boto_s3_client,
         'file_cache': fs_file_cache,
     },
     system_storage_defs=s3_plus_default_storage_defs,
@@ -47,7 +47,7 @@ local_mode = ModeDefinition(
     name='local',
     resource_defs={
         'spark': pyspark_resource,
-        's3': s3_resource,
+        's3': boto_s3_client,
         'db_info': postgres_db_info_resource,
         'tempfile': tempfile_resource,
         'file_cache': fs_file_cache,
@@ -60,7 +60,7 @@ prod_mode = ModeDefinition(
     name='prod',
     resource_defs={
         'spark': pyspark_resource,  # FIXME
-        's3': s3_resource,
+        's3': boto_s3_client,
         'db_info': redshift_db_info_resource,
         'tempfile': tempfile_resource,
         'file_cache': s3_file_cache,
