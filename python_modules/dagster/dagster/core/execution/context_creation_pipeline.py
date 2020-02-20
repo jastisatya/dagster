@@ -25,7 +25,7 @@ from dagster.core.storage.pipeline_run import PipelineRun
 from dagster.core.storage.type_storage import construct_type_storage_plugin_registry
 from dagster.core.system_config.objects import EnvironmentConfig
 from dagster.loggers import default_loggers, default_system_loggers
-from dagster.utils import ensure_gen, merge_dicts
+from dagster.utils import EventGenerationManager, ensure_gen, merge_dicts
 from dagster.utils.error import serializable_error_info_from_exc_info
 
 from .context.init import InitResourceContext
@@ -162,36 +162,6 @@ def create_context_creation_data(
     )
 
 
-class EventGenerationManager(object):
-    def __init__(self, generator, object_cls):
-        self.generator = generator
-        self.object_cls = object_cls
-        self.object = None
-        self.has_generated = False
-
-    def generate_setup_events(self):
-        self.has_generated = True
-        try:
-            while self.object is None:
-                obj = next(self.generator)
-                if isinstance(obj, self.object_cls):
-                    self.object = obj
-                else:
-                    yield obj
-        except StopIteration:
-            pass
-
-    def get_object(self):
-        if not self.has_generated:
-            check.failed('Called `get_object` before `generate_setup_events`')
-        return self.object
-
-    def generate_teardown_events(self):
-        if self.object:
-            for event in self.generator:
-                yield event
-
-
 def pipeline_initialization_manager(
     pipeline_def,
     environment_dict,
@@ -217,7 +187,7 @@ def pipeline_initialization_manager(
         system_storage_data,
         raise_on_error,
     )
-    return EventGenerationManager(generator, SystemPipelineExecutionContext)
+    return EventGenerationManager(generator, SystemPipelineExecutionContext, raise_on_error)
 
 
 def pipeline_initialization_event_generator(
@@ -261,7 +231,9 @@ def pipeline_initialization_event_generator(
         )
         for event in resources_manager.generate_setup_events():
             yield event
-        scoped_resources_builder = resources_manager.get_object()
+        scoped_resources_builder = check.inst(
+            resources_manager.get_object(), ScopedResourcesBuilder
+        )
         system_storage_data = create_system_storage_data(
             context_creation_data, system_storage_data, scoped_resources_builder
         )
@@ -293,16 +265,13 @@ def pipeline_initialization_event_generator(
                 log_manager=_create_context_free_log_manager(instance, pipeline_run, pipeline_def),
             )
 
-            if resources_manager:
-                for event in resources_manager.generate_teardown_events():
-                    yield event
+        if resources_manager:
+            for event in resources_manager.generate_teardown_events():
+                yield event
 
-            if raise_on_error:
-                raise dagster_error
-
-        # if we've caught an error after context init we're in a problematic state and
-        # should just raise
-        else:
+        if pipeline_context or raise_on_error:
+            # if we've caught an error after context init we're in a problematic state and
+            # should just raise
             raise dagster_error
 
 
@@ -418,39 +387,62 @@ def resource_initialization_event_generator(
     resource_instances = {}
     mode_definition = pipeline_def.get_mode_definition(pipeline_run.mode)
     resource_managers = deque()
+    generator_closed = False
 
-    for resource_name, resource_def in sorted(mode_definition.resource_defs.items()):
-        if not resource_name in resource_keys_to_init:
-            continue
-        resource_context = InitResourceContext(
-            pipeline_def=pipeline_def,
-            resource_def=resource_def,
-            resource_config=environment_config.resources.get(resource_name, {}).get('config'),
-            run_id=pipeline_run.run_id,
-            log_manager=log_manager,
-        )
-        manager = single_resource_generation_manager(resource_context, resource_name, resource_def)
-        for event in manager.generate_setup_events():
-            if event:
-                yield event
-        resource_instances[resource_name] = manager.get_object().resource
-        resource_managers.append(manager)
+    try:
+        for resource_name, resource_def in sorted(mode_definition.resource_defs.items()):
+            if not resource_name in resource_keys_to_init:
+                continue
+            resource_context = InitResourceContext(
+                pipeline_def=pipeline_def,
+                resource_def=resource_def,
+                resource_config=environment_config.resources.get(resource_name, {}).get('config'),
+                run_id=pipeline_run.run_id,
+                log_manager=log_manager,
+            )
+            manager = single_resource_generation_manager(
+                resource_context, resource_name, resource_def
+            )
+            for event in manager.generate_setup_events():
+                if event:
+                    yield event
+            initialized_resource = check.inst(manager.get_object(), InitializedResource)
+            resource_instances[resource_name] = initialized_resource.resource
+            resource_managers.append(manager)
 
-    yield ScopedResourcesBuilder(resource_instances)
-    while len(resource_managers) > 0:
-        manager = resource_managers.pop()
-        for event in manager.generate_teardown_events():
-            yield event
+        yield ScopedResourcesBuilder(resource_instances)
+    except GeneratorExit:
+        # Shouldn't happen, but avoid runtime-exception in case this generator gets GC-ed
+        # (see https://amir.rachum.com/blog/2017/03/03/generator-cleanup/).
+        generator_closed = True
+        raise
+    finally:
+        if not generator_closed:
+            error = None
+            while len(resource_managers) > 0:
+                manager = resource_managers.pop()
+                try:
+                    for event in manager.generate_teardown_events():
+                        yield event
+                except DagsterUserCodeExecutionError as dagster_user_error:
+                    error = dagster_user_error
+            if error:
+                raise error
 
 
-class WrappedResource(object):
+class InitializedResource(object):
+    ''' Utility class to wrap the untyped resource object emitted from the user-supplied
+    resource function.  Used for distinguishing from the framework-yielded events in an
+    `EventGenerationManager`-wrapped event stream.
+    '''
+
     def __init__(self, obj):
         self.resource = obj
 
 
 def single_resource_generation_manager(context, resource_name, resource_def):
     generator = single_resource_event_generator(context, resource_name, resource_def)
-    return EventGenerationManager(generator, WrappedResource)
+    return EventGenerationManager(generator, InitializedResource)
 
 
 def single_resource_event_generator(context, resource_name, resource_def):
@@ -463,7 +455,7 @@ def single_resource_event_generator(context, resource_name, resource_def):
                 resource_or_gen = resource_def.resource_fn(context)
                 gen = ensure_gen(resource_or_gen)
                 resource = next(gen)
-                yield WrappedResource(resource)
+                yield InitializedResource(resource)
             except StopIteration:
                 check.failed(
                     'Resource generator {name} must yield one item.'.format(name=resource_name)
@@ -514,7 +506,7 @@ def scoped_pipeline_context(
     for _ in initialization_manager.generate_setup_events():
         pass
 
-    yield initialization_manager.get_object()
+    yield check.inst(initialization_manager.get_object(), SystemPipelineExecutionContext)
     for _ in initialization_manager.generate_teardown_events():
         pass
 
