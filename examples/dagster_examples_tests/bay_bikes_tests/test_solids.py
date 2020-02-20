@@ -133,7 +133,7 @@ def test_download_weather_report_from_weather_api_200(mocker, setup_dark_sky, mo
     assert 'uuid' in solid_result.columns
 
 
-# pylint: disable=W0613
+# pylint: disable=unused-argument
 def mock_read_sql(table_name, _engine, index_col=None):
     if table_name == 'weather':
         return DataFrame(FAKE_WEATHER_DATA)
