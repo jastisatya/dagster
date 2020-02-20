@@ -260,8 +260,7 @@ def test_set_solid_configable_input_bad():
         )
 
     expected = (
-        'Error 1: Type failure at path "root:solids:set_solid:inputs:set_input". '
-        'Value at path root:solids:set_solid:inputs:set_input must be list. '
+        'Error 1: Value at path root:solids:set_solid:inputs:set_input must be list. '
         'Expected: [(String | { json: { path: Path } pickle: { path: Path } value: String })].'
     )
 
