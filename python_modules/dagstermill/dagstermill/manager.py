@@ -19,7 +19,6 @@ from dagster.core.definitions.dependency import SolidHandle
 from dagster.core.definitions.resource import ScopedResourcesBuilder
 from dagster.core.execution.api import create_execution_plan, scoped_pipeline_context
 from dagster.core.execution.context_creation_pipeline import (
-    EventGenerationManager,
     get_required_resource_keys_to_init,
     resource_initialization_event_generator,
 )
@@ -28,6 +27,7 @@ from dagster.core.serdes import unpack_value
 from dagster.core.storage.pipeline_run import PipelineRun, PipelineRunStatus
 from dagster.core.utils import make_new_run_id
 from dagster.loggers import colored_console_logger
+from dagster.utils import EventGenerationManager
 
 from .context import DagstermillExecutionContext
 from .errors import DagstermillError
@@ -35,6 +35,11 @@ from .serialize import PICKLE_PROTOCOL, read_value, write_value
 
 
 class DagstermillResourceEventGenerationManager(EventGenerationManager):
+    ''' Utility class to explicitly manage setup/teardown of resource events. Overrides the default
+    `generate_teardown_events` method so that teardown is deferred until explicitly called by the
+    dagstermill Manager
+    '''
+
     def generate_teardown_events(self):
         return iter(())
 
@@ -56,6 +61,11 @@ class Manager(object):
     def _setup_resources(
         self, pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init
     ):
+        '''
+        Drop-in replacement for
+        `dagster.core.execution.context_creation_pipeline.resource_initialization_manager`.  It uses
+        a `DagstermillResourceEventGenerationManager` and explicitly calls `teardown` on it
+        '''
         generator = resource_initialization_event_generator(
             pipeline_def, environment_config, pipeline_run, log_manager, resource_keys_to_init
         )
