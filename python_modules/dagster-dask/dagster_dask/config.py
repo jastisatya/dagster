@@ -51,7 +51,7 @@ class DaskConfig(
             << use client here >>
 
         '''
-        dask_cfg = {'name': pipeline_name}
+        dask_cfg = {'name': pipeline_name, 'threads_per_worker': 1}
         for cfg_param in [
             'address',
             'timeout',
