@@ -26,6 +26,6 @@ solids:
           file_name: training_data
   train_lstm_model:
     config:
-      timeseries_train_test_breakpoint: 550
+      timeseries_train_test_breakpoint: 50
       model_trainig_config:
         num_epochs: 200
