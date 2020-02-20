@@ -1,6 +1,13 @@
+import boto3
+
 from dagster import Field, resource
 
 from .utils import create_s3_session
+
+
+@resource
+def boto_s3_client(_):
+    return boto3.resource('s3').meta.client
 
 
 class S3Resource(object):
